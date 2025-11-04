@@ -27,15 +27,21 @@
   </div>
 <script>
   const ENDPOINT = 'https://script.google.com/macros/s/AKfycbyRvdRDBiV9p_Byd9hMUxLDqpgtmvuJpL5xvyDcDLPUzZ6Pba8AuvC4Km8H2j2tfNTBFQ/exec';
-  const video = document.getElementById('preview');
+
+  const video    = document.getElementById('preview');
   const statusEl = document.getElementById('status');
   const startBtn = document.getElementById('start');
   const torchBtn = document.getElementById('torch');
   const undoBtn  = document.getElementById('undo');
 
-  let codeReader, controls, currentDeviceId = null, lastScan = {text:null, ts:0}, lastSent = null;
+  let stream = null;
+  let codeReader = null;
+  let controls = null;
+  let currentDeviceId = null;
+  let lastScan = { text: null, ts: 0 };
+  let lastSent = null;
 
-  function setStatus(t) { statusEl.textContent = t; }
+  function setStatus(t) { statusEl.textContent = t; console.log('[status]', t); }
 
   function uuid() {
     return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
@@ -43,84 +49,141 @@
     );
   }
 
-  async function startScanner() {
-    setStatus('starting camera…');
-    codeReader = new ZXingBrowser.BrowserMultiFormatReader();
-    const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
-    currentDeviceId = (devices.find(d => /back|rear|environment/i.test(d.label)) || devices[0])?.deviceId;
-    if (!currentDeviceId) throw new Error('No camera found');
+  async function ensureCameraPermission() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('getUserMedia not supported. Use a modern browser (HTTPS required).');
+    }
+    try {
+      // Try environment first; iOS Safari honors facingMode better on a user gesture.
+      return await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+        audio: false
+      });
+    } catch (e) {
+      // As a fallback, allow any camera.
+      setStatus('Retrying with default camera…');
+      return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+  }
 
-    controls = await codeReader.decodeFromVideoDevice(currentDeviceId, video, (result, err) => {
-      if (result) handleResult(result.getText());
-      // ignore err frames; decoder throws while probing
-    });
-    setStatus('point at a barcode…');
+  async function attachStream(s) {
+    stream = s;
+    video.srcObject = stream;
+    // iOS requires play() after a user gesture
+    await video.play();
+    setStatus('Camera ready. Point at a barcode…');
+  }
+
+  async function pickBackCamera() {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const vids = devices.filter(d => d.kind === 'videoinput');
+    if (!vids.length) throw new Error('No camera devices found.');
+    const back = vids.find(d => /back|rear|environment/i.test(d.label));
+    return (back || vids[0]).deviceId;
+  }
+
+  async function startZXing() {
+    if (!window.ZXingBrowser) {
+      setStatus('ZXing not loaded; scanning disabled.');
+      return;
+    }
+    codeReader = new ZXingBrowser.BrowserMultiFormatReader();
+
+    // Prefer the specific deviceId if we can get it (post-permission labels are available)
+    try {
+      currentDeviceId = await pickBackCamera();
+    } catch (e) {
+      console.warn('pickBackCamera failed:', e);
+    }
+
+    // If we already have a live <video>, ZXing can read directly from it.
+    try {
+      controls = await codeReader.decodeFromVideoElement(video, (result, err) => {
+        if (result) handleResult(result.getText());
+      });
+      setStatus('Scanner active. Scan a code…');
+    } catch (e) {
+      // Fallback to device-based decoding
+      setStatus('Switching to device-based scanner…');
+      controls = await codeReader.decodeFromVideoDevice(currentDeviceId || null, video, (result, err) => {
+        if (result) handleResult(result.getText());
+      });
+      setStatus('Scanner active. Scan a code…');
+    }
+  }
+
+  async function startCamera() {
+    try {
+      setStatus('Requesting camera…');
+      // 1) Ask for camera and attach stream
+      const s = await ensureCameraPermission();
+      await attachStream(s);
+
+      // 2) Start the decoder after stream is playing
+      await startZXing();
+    } catch (err) {
+      console.error(err);
+      let msg = String(err && err.message || err);
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+        msg += ' | Tip: Must be served over HTTPS (or localhost) for camera access.';
+      }
+      setStatus('Error: ' + msg);
+      alert('Camera error:\n' + msg);
+    }
   }
 
   async function handleResult(text) {
     const now = Date.now();
-    if (text === lastScan.text && (now - lastScan.ts) < 1500) {
-      return; // debounce duplicate frames
-    }
+    if (text === lastScan.text && (now - lastScan.ts) < 1500) return; // debounce
     lastScan = { text, ts: now };
     setStatus(`scanned: ${text}`);
-
     try { navigator.vibrate?.(60); } catch {}
-    try { new AudioContext().resume(); } catch {}
 
-    // send to Apps Script
-    const payload = {
-      scan_id: uuid(),
-      barcode: text,
-      delta: -1,                // decrement by 1
-      device: currentDeviceId || 'unknown'
-    };
+    // Send to your endpoint
+    const payload = { scan_id: uuid(), barcode: text, delta: -1, device: currentDeviceId || 'unknown' };
     lastSent = payload;
 
-    const resp = await fetch(ENDPOINT, {
-      method:'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok) {
-      setStatus(`error: ${data.error || resp.status}`);
-      return;
-    }
-    if (data.duplicate) {
-      setStatus(`duplicate (ignored)`);
-    } else {
-      setStatus(`ok. stock: ${data.stock_after}`);
+    try {
+      const resp = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        setStatus(`write error: ${data.error || resp.status}`);
+      } else if (data.duplicate) {
+        setStatus('duplicate (ignored)');
+      } else {
+        setStatus(`ok. stock: ${data.stock_after}`);
+      }
+    } catch (e) {
+      setStatus('network error (saved locally?)');
+      console.error(e);
     }
   }
 
   async function toggleTorch() {
     const track = video.srcObject?.getVideoTracks?.()[0];
-    if (!track) return;
+    if (!track) return setStatus('no video track');
     const caps = track.getCapabilities?.() || {};
-    if (!('torch' in caps)) { setStatus('torch not supported'); return; }
-    const current = track.getSettings().torch || false;
-    await track.applyConstraints({ advanced: [{ torch: !current }]});
-    setStatus(!current ? 'torch on' : 'torch off');
+    if (!('torch' in caps)) return setStatus('torch not supported on this device');
+    const on = !!track.getSettings().torch;
+    await track.applyConstraints({ advanced: [{ torch: !on }] });
+    setStatus(!on ? 'torch on' : 'torch off');
   }
 
   async function undoLast() {
     if (!lastSent) return setStatus('nothing to undo');
-    const payload = { ...lastSent, scan_id: uuid(), delta: +1 }; // add one back
-    const resp = await fetch(ENDPOINT, {
-      method:'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await resp.json();
+    const payload = { ...lastSent, scan_id: uuid(), delta: +1 };
+    const resp = await fetch(ENDPOINT, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const data = await resp.json().catch(() => ({}));
     setStatus(data.ok ? `undo ok. stock: ${data.stock_after}` : `undo failed`);
   }
 
-  startBtn.onclick = startScanner;
+  startBtn.onclick = startCamera;   // user gesture → camera permission works on iOS
   torchBtn.onclick = toggleTorch;
   undoBtn.onclick  = undoLast;
-
-  // iOS needs user gesture to start; we bind to button intentionally.
 </script>
 </body>
 </html>
