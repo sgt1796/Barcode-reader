@@ -146,8 +146,7 @@
     try {
       const resp = await fetch(ENDPOINT, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload)  // text/plain by default
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data.ok) {
