@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Union Dental Scanner</title>
+  <style>
+    html,body { margin:0; height:100%; background:#000; color:#fff; font-family:system-ui; }
+    .wrap { display:flex; flex-direction:column; height:100%; }
+    video { width:100%; height:100%; object-fit:cover; }
+    .toolbar { position:fixed; bottom:0; left:0; right:0; display:flex; gap:8px; padding:12px; background:rgba(0,0,0,.6); backdrop-filter:blur(6px); }
+    button { flex:1; padding:14px 16px; border-radius:12px; border:0; font-size:16px; }
+    .pill { position:fixed; top:12px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.6); padding:8px 12px; border-radius:999px; font-weight:600; }
+  </style>
+  <!-- ZXing JS (browser bundle) -->
+  <script src="https://unpkg.com/@zxing/browser@latest"></script>
+</head>
+<body>
+  <div class="wrap">
+    <video id="preview" playsinline muted></video>
+    <div id="status" class="pill">ready</div>
+    <div class="toolbar">
+      <button id="start">Start</button>
+      <button id="torch">Torch</button>
+      <button id="undo">Undo</button>
+    </div>
+  </div>
+<script>
+  const ENDPOINT = 'https://script.google.com/macros/s/AKfycbyRvdRDBiV9p_Byd9hMUxLDqpgtmvuJpL5xvyDcDLPUzZ6Pba8AuvC4Km8H2j2tfNTBFQ/exec';
+  const video = document.getElementById('preview');
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('start');
+  const torchBtn = document.getElementById('torch');
+  const undoBtn  = document.getElementById('undo');
+
+  let codeReader, controls, currentDeviceId = null, lastScan = {text:null, ts:0}, lastSent = null;
+
+  function setStatus(t) { statusEl.textContent = t; }
+
+  function uuid() {
+    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
+      (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
+    );
+  }
+
+  async function startScanner() {
+    setStatus('starting camera…');
+    codeReader = new ZXingBrowser.BrowserMultiFormatReader();
+    const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
+    currentDeviceId = (devices.find(d => /back|rear|environment/i.test(d.label)) || devices[0])?.deviceId;
+    if (!currentDeviceId) throw new Error('No camera found');
+
+    controls = await codeReader.decodeFromVideoDevice(currentDeviceId, video, (result, err) => {
+      if (result) handleResult(result.getText());
+      // ignore err frames; decoder throws while probing
+    });
+    setStatus('point at a barcode…');
+  }
+
+  async function handleResult(text) {
+    const now = Date.now();
+    if (text === lastScan.text && (now - lastScan.ts) < 1500) {
+      return; // debounce duplicate frames
+    }
+    lastScan = { text, ts: now };
+    setStatus(`scanned: ${text}`);
+
+    try { navigator.vibrate?.(60); } catch {}
+    try { new AudioContext().resume(); } catch {}
+
+    // send to Apps Script
+    const payload = {
+      scan_id: uuid(),
+      barcode: text,
+      delta: -1,                // decrement by 1
+      device: currentDeviceId || 'unknown'
+    };
+    lastSent = payload;
+
+    const resp = await fetch(ENDPOINT, {
+      method:'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      setStatus(`error: ${data.error || resp.status}`);
+      return;
+    }
+    if (data.duplicate) {
+      setStatus(`duplicate (ignored)`);
+    } else {
+      setStatus(`ok. stock: ${data.stock_after}`);
+    }
+  }
+
+  async function toggleTorch() {
+    const track = video.srcObject?.getVideoTracks?.()[0];
+    if (!track) return;
+    const caps = track.getCapabilities?.() || {};
+    if (!('torch' in caps)) { setStatus('torch not supported'); return; }
+    const current = track.getSettings().torch || false;
+    await track.applyConstraints({ advanced: [{ torch: !current }]});
+    setStatus(!current ? 'torch on' : 'torch off');
+  }
+
+  async function undoLast() {
+    if (!lastSent) return setStatus('nothing to undo');
+    const payload = { ...lastSent, scan_id: uuid(), delta: +1 }; // add one back
+    const resp = await fetch(ENDPOINT, {
+      method:'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    setStatus(data.ok ? `undo ok. stock: ${data.stock_after}` : `undo failed`);
+  }
+
+  startBtn.onclick = startScanner;
+  torchBtn.onclick = toggleTorch;
+  undoBtn.onclick  = undoLast;
+
+  // iOS needs user gesture to start; we bind to button intentionally.
+</script>
+</body>
+</html>
