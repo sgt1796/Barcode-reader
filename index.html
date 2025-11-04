@@ -176,7 +176,10 @@
   async function undoLast() {
     if (!lastSent) return setStatus('nothing to undo');
     const payload = { ...lastSent, scan_id: uuid(), delta: +1 };
-    const resp = await fetch(ENDPOINT, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const resp = await fetch(ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify(payload)  // text/plain by default
+    });
     const data = await resp.json().catch(() => ({}));
     setStatus(data.ok ? `undo ok. stock: ${data.stock_after}` : `undo failed`);
   }
